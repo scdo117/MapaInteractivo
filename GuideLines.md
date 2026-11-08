@@ -32,10 +32,11 @@ Usuario principal: un solo atleta (yo). Diseñar la arquitectura multiusuario (p
 | Parsing GPX | `System.Xml` con DTD deshabilitado | Ver §5.5 |
 | Jobs en segundo plano | `BackgroundService` + `System.Threading.Channels` | Hangfire solo si se requieren reintentos persistentes |
 | Vector tiles | Martin (servidor de tiles de PostGIS) | Siempre detrás de la API autenticada (proxy), nunca expuesto |
-| Frontend | Vite + TypeScript (strict) + Svelte 5 | React es aceptable si se decide antes de empezar; no mezclar |
-| Mapa | MapLibre GL JS | No usar Leaflet. No usar tiles raster de OSM por defecto |
-| Mapa base | Protomaps (PMTiles autoalojado) + estilo propio | Estilo diseñado a medida (§6.2) |
-| Map matching (fase 3) | Valhalla en Docker con extracto de México (Geofabrik) | Opcional |
+| Identidad | ASP.NET Core Identity (email + contraseña, TOTP 2FA) | Registro cerrado; el dueño se crea por CLI. Strava es una conexión de datos, NO un método de login (§5.3) |
+| Frontend | Vite + TypeScript (strict) + Svelte 5, SPA (sin SvelteKit) | **Decidido.** No usar React ni mezclar frameworks |
+| Mapa | MapLibre GL JS, build CSP (`maplibre-gl-csp.js` + worker propio) | No usar Leaflet. No usar tiles raster de OSM por defecto |
+| Mapa base | Protomaps (PMTiles autoalojado) + estilo propio | Estilo diseñado a medida (§7.2) |
+| Map matching (fase 7) | Valhalla en Docker con extracto de México (Geofabrik) | Opcional |
 | Infraestructura | Docker Compose + Caddy (HTTPS automático) | Un VPS; sin servicios administrados innecesarios |
 | Tests | xUnit + Testcontainers (Postgres/PostGIS reales), Vitest, Playwright | Nada de mocks de PostGIS para lógica espacial |
 
@@ -85,36 +86,64 @@ oauth_connections(
   expires_at timestamptz, created_at, updated_at
 )
 
+-- Actividad CANÓNICA: una rodada real = una fila, aunque llegue por varias fuentes
 activities(
   id uuid pk, user_id uuid fk,
-  source text,                 -- 'garmin_fit' | 'gpx' | 'strava'
-  source_id text,              -- id externo (único por user+source)
+  primary_source_id uuid fk -> activity_sources,  -- la fuente cuya geometría se usa
   name text, sport_type text, started_at timestamptz,
   distance_m real, elevation_gain_m real, moving_time_s int,
-  geom geometry(LineString, 4326),        -- completa, para consultas
-  geom_simplified geometry(LineString, 4326), -- para render
-  attribution text,            -- p. ej. 'garmin' si requiere atribución
-  created_at,
-  unique(user_id, source, source_id)
+  geom_raw geometry(LineString, 4326),     -- PRIVADA: nunca sale del servidor (§5.1)
+  geom_public geometry(LineString, 4326),  -- ya recortada por privacidad; base de TODO lo que sale
+  geom_render geometry(LineString, 4326),  -- geom_public simplificada para tiles
+  geom_thumb geometry(LineString, 4326),   -- geom_public muy simplificada (≤ 100 vértices) para miniaturas
+  elevation_profile real[],                -- 64 muestras equidistantes; null si la fuente no trae altitud
+  privacy_version int not null,            -- versión de zonas con la que se calculó geom_public
+  created_at, updated_at
 )
-create index on activities using gist(geom);
-create index on activities using gist(geom_simplified);
+create index on activities using gist(geom_public);
+create index on activities using gist(geom_render);
 create index on activities(user_id, started_at);
 
-privacy_zones(id uuid pk, user_id uuid fk, center geography(Point), radius_m int, created_at)
+-- Cada fuente que aportó la actividad (Garmin, Strava, GPX). Idempotencia por fuente.
+activity_sources(
+  id uuid pk, activity_id uuid fk, user_id uuid fk,
+  source text,                 -- 'garmin_fit' | 'gpx' | 'strava'
+  source_id text,              -- id externo o hash SHA-256 del archivo
+  resolution_rank int,         -- 1 FIT > 2 Strava streams > 3 GPX > 4 summary_polyline
+  attribution text,            -- p. ej. 'garmin' si requiere atribución
+  external_url text,           -- p. ej. URL de Strava para "View on Strava"
+  imported_at timestamptz,
+  unique(user_id, source, source_id)
+)
+
+privacy_settings(
+  user_id uuid pk,
+  setup_completed_at timestamptz,          -- null = onboarding de privacidad pendiente (§5.1)
+  trim_start_end_m int not null default 400,
+  version int not null default 1           -- se incrementa con cada cambio de zonas o trim
+)
+
+privacy_zones(id uuid pk, user_id uuid fk, center geography(Point), radius_m int, offset_seed int, created_at)
 
 import_jobs(id uuid pk, user_id uuid fk, status text, total int, processed int, error text, created_at, updated_at)
 ```
 
 - Habilita **RLS** en `activities`, `privacy_zones`, `oauth_connections`, `import_jobs` con la política `user_id = current_setting('app.user_id')::uuid`. La API fija `app.user_id` por transacción.
-- Deduplicación: una misma rodada puede llegar por Garmin y por Strava. Detecta duplicados por `started_at` (±2 min) + distancia (±3 %) y conserva la de mayor resolución.
+- RLS también en `activity_sources` y `privacy_settings`.
+- **Dos mecanismos de deduplicación distintos (no confundirlos):**
+  1. **Idempotencia dentro de una fuente:** la restricción `unique(user_id, source, source_id)` en `activity_sources`. Reimportar el mismo archivo o recibir el mismo webhook no crea nada nuevo.
+  2. **Unificación entre fuentes** (misma rodada vía Garmin y vía Strava): lógica en el Worker. Candidatos = mismo usuario, `started_at` ±2 min y distancia ±3 %. Se confirma si `ST_HausdorffDistance` entre las geometrías (en metros, proyectando a UTM) es < 50 m. Si coincide, la nueva fuente se **enlaza** a la actividad existente como otra fila de `activity_sources` (no se descarta: así se conserva el enlace "View on Strava" aunque la geometría venga de Garmin). La geometría canónica es la de menor `resolution_rank`.
+  - Un candidato que cumple tiempo y distancia pero falla Hausdorff se guarda como actividad separada y se registra en logs (sin coordenadas) para revisión.
 
 ---
 
 ## 5. Seguridad — reglas MUST
 
 ### 5.1 Privacidad de ubicación
-- **MUST** recortar las zonas de privacidad (`ST_Difference` con un buffer) en **todo** lo que sale del servidor: tiles, resultados del click, exportaciones y miniaturas.
+- **Fail-closed:** mientras `privacy_settings.setup_completed_at` sea null, la API **MUST** responder `409` con `{"code":"privacy_setup_required"}` en tiles, click, exportaciones y miniaturas. El frontend lleva al onboarding de privacidad. Completar el onboarding sin zonas solo es posible confirmando explícitamente "no quiero zonas".
+- **Recorte por defecto siempre activo:** se eliminan los primeros y últimos `trim_start_end_m` (por defecto 400 m) de **cada** actividad, aunque no haya zonas. Bajarlo a 0 requiere una acción explícita en la configuración.
+- **Geometría materializada:** el recorte (trim + `ST_Difference` con los buffers de las zonas) se calcula en el Worker y se guarda en `geom_public`. **Todo** lo que sale del servidor (tiles, click, exportaciones, miniaturas) se deriva de `geom_public`, `geom_render` o `geom_thumb`; **MUST NOT** usar `geom_raw` en ninguna consulta expuesta. `geom_raw` solo se usa para deduplicar y recalcular.
+- Al cambiar zonas o trim: se incrementa `privacy_settings.version` y un job recalcula las geometrías derivadas. Mientras haya actividades con `privacy_version` desactualizada, esas actividades **no se sirven** (fail-closed también aquí).
 - **MUST** aplicar el recorte en el servidor, nunca en el cliente.
 - Para evitar triangulación: radio mínimo de 300 m, y el centro del buffer se desplaza aleatoriamente (estable por zona) entre 50 y 150 m del punto real.
 - **MUST** filtrar cada tile por el `user_id` de la **sesión**. Nunca aceptar `user_id` como parámetro del cliente. Las URLs `/{z}/{x}/{y}` son adivinables (riesgo IDOR).
@@ -129,7 +158,15 @@ import_jobs(id uuid pk, user_id uuid fk, status text, total int, processed int, 
 - Las API keys de proveedores de mapas se restringen por dominio (`Referer`).
 
 ### 5.3 Autenticación y sesión
-- OAuth 2.0 **authorization code flow** en el servidor, con el parámetro `state` (anti-CSRF) ligado a la sesión y de un solo uso.
+- **Identidad local (fase 1):** ASP.NET Core Identity con email + contraseña.
+  - Hash por defecto de Identity (PBKDF2), con iteraciones al valor recomendado actual o mayores.
+  - Contraseña mínima de 12 caracteres; sin reglas de composición forzadas.
+  - **TOTP 2FA** disponible desde la fase 1, obligatorio para el usuario dueño.
+  - Lockout tras 5 intentos fallidos (15 min).
+  - **Registro público deshabilitado.** El usuario dueño se crea con un comando de CLI (`dotnet run --project src/Api -- create-owner`) que pide los datos de forma interactiva y nunca los acepta como argumentos (para que no queden en el historial de la shell).
+  - Mensajes de error de login genéricos: no revelar si el email existe.
+- **Strava es una conexión de datos, no un método de login.** Se conecta desde la configuración de un usuario ya autenticado (fase 5).
+- OAuth 2.0 con Strava: **authorization code flow** en el servidor, con el parámetro `state` (anti-CSRF) ligado a la sesión y de un solo uso.
 - Scopes mínimos: `activity:read`; `activity:read_all` solo si el usuario lo activa explícitamente.
 - Cookies de sesión con `HttpOnly`, `Secure`, `SameSite=Lax`, rotación al iniciar sesión y expiración por inactividad.
 - Protección anti-CSRF en todos los endpoints que mutan estado (antiforgery de ASP.NET Core).
@@ -158,17 +195,25 @@ import_jobs(id uuid pk, user_id uuid fk, status text, total int, processed int, 
 
 ### 5.7 Headers y transporte
 - HTTPS obligatorio (Caddy), con HSTS `max-age=31536000; includeSubDomains`.
-- **CSP estricta**:
+- **CSP estricta, sin `unsafe-inline` ni `unsafe-eval`:**
   ```
   default-src 'self';
   script-src 'self';
-  style-src 'self' 'unsafe-inline';   # MapLibre lo requiere; revisar si se puede eliminar
+  style-src 'self';
   img-src 'self' data: blob:;
-  worker-src 'self' blob:;
+  worker-src 'self';
   connect-src 'self';
   font-src 'self';
+  object-src 'none';
+  base-uri 'none';
+  form-action 'self';
   frame-ancestors 'none';
   ```
+  - Usa el **build CSP de MapLibre** (`maplibre-gl-csp.js`) y sirve su worker desde el propio origen (`setWorkerUrl`). Así no hace falta `blob:` en `worker-src`.
+  - Carga `maplibre-gl.css` como hoja estática. Los estilos que MapLibre y Svelte aplican vía propiedades del DOM (`element.style.x = …`) no están sujetos a `style-src`; las etiquetas `<style>` inline y los atributos `style` en el HTML sí lo están.
+  - Vite debe extraer todo el CSS a archivos (sin inyección de `<style>` en producción).
+  - Durante el desarrollo, activa primero `Content-Security-Policy-Report-Only` con un endpoint de reporte. Un test de Playwright **MUST** fallar si aparece cualquier violación de CSP en el flujo principal.
+  - Si una dependencia exige estilos inline: primero busca una alternativa; si no la hay, usa un **hash** o **nonce** para ese caso concreto, documentado en §12. **Nunca** `unsafe-inline` global.
 - `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` y `Permissions-Policy` con geolocalización deshabilitada salvo que se use.
 - CORS: solo el origen propio, sin comodines.
 - Fuentes e iconos **autoalojados** (sin Google Fonts en runtime), por privacidad y por CSP.
@@ -192,7 +237,8 @@ import_jobs(id uuid pk, user_id uuid fk, status text, total int, processed int, 
 - El enlace a la actividad original lleva exactamente el texto **"View on Strava"**.
 - Los logos "Powered by / Compatible with Strava" se usan sin modificar, alterar ni animar, y sin sugerir afiliación ni patrocinio de Strava.
 - Si una actividad viene de un dispositivo Garmin vía Strava, se muestra la atribución a Garmin según sus lineamientos (campo `attribution`).
-- El base URL del API es **configurable** (`STRAVA_API_BASE_URL`): está anunciado `https://api-v3.strava.com` para enero de 2027. Los tokens van **siempre en el header `Authorization`**, nunca en el query string.
+- El base URL del API es **configurable** (`STRAVA_API_BASE_URL`, valor por defecto `https://www.strava.com/api/v3`). Strava anunció un nuevo base URL, `https://api-v3.strava.com`, **disponible a partir del 4 de enero de 2027**, con una ventana de migración antes de una fecha límite. Al iniciar la fase 5, **MUST** verificar el changelog oficial (developers.strava.com) para confirmar la URL vigente y la fecha límite, y actualizar este punto.
+- Los tokens van **siempre en el header `Authorization: Bearer`**, nunca en el query string (requisito explícito de los cambios de 2027).
 - Respeta los rate limits leyendo los headers de uso, con backoff exponencial y una cola; para el historial, prefiere el listado de actividades con `summary_polyline` (200 por página).
 
 ---
@@ -244,8 +290,8 @@ Estas son las señales típicas de una "app hecha por IA". **No las uses:**
 ### 7.6 Panel de resultados (narrativa, no tabla)
 - El encabezado cuenta la historia: *"Has pasado por aquí 47 veces · la primera en marzo de 2021 · la última hace 3 días"*.
 - Lista agrupada por año → mes. Cada item muestra:
-  - una miniatura de la silueta de la ruta (SVG generado),
-  - una sparkline del perfil de elevación,
+  - una miniatura de la silueta de la ruta: el endpoint del click devuelve `geom_thumb` como polyline codificada (≤ 100 vértices) y el **cliente** la dibuja como `<path>` SVG en un componente Svelte. No se guarda SVG en la base de datos;
+  - una sparkline del perfil de elevación a partir de `elevation_profile` (64 muestras calculadas al importar). Si es null, no se muestra la sparkline (sin placeholder falso),
   - fecha, distancia y desnivel,
   - el enlace "View on Strava" si aplica.
 - **Vinculación en ambos sentidos:** pasar el cursor o enfocar un item resalta su ruta en el mapa, y viceversa.
@@ -318,8 +364,8 @@ Build → lint → tests → audit de dependencias → escaneo de secretos → c
 
 ## 9. Fases de desarrollo
 
-1. **Fundaciones:** Docker Compose (Postgres+PostGIS, API, Caddy), migraciones, RLS, headers de seguridad, auth de sesión local, `.env.example`.
-2. **Importación Garmin/GPX:** carga del ZIP del export con todas las protecciones (§5.5), parsing en el Worker, deduplicación, zonas de privacidad.
+1. **Fundaciones:** Docker Compose (Postgres+PostGIS, API, Caddy), migraciones con todas las tablas de §4, RLS, headers de seguridad y CSP (§5.7), identidad local con ASP.NET Core Identity + TOTP + comando `create-owner` (§5.3), scaffolding de `web/` en Svelte 5, `.env.example`.
+2. **Privacidad e importación Garmin/GPX:** primero `privacy_settings`, zonas, trim y el onboarding de privacidad con fail-closed (§5.1); después la carga del ZIP del export con todas las protecciones (§5.5), parsing en el Worker, cálculo de `geom_public`/`geom_render`/`geom_thumb`/`elevation_profile` y los dos mecanismos de deduplicación (§4). **Ningún endpoint que exponga geometría puede existir antes de que el fail-closed esté implementado y probado.**
 3. **Mapa y heatmap:** estilo de mapa base propio, Martin detrás del proxy autenticado, tokens de diseño, capa del heatmap.
 4. **Click por calle:** endpoint con `ST_DWithin`, interacción completa (§7.5), panel de resultados (§7.6), buscador de calles.
 5. **Strava:** OAuth, sincronización del historial, webhooks, desautorización, atribuciones y cumplimiento (§6).
@@ -349,3 +395,18 @@ Cada fase termina con sus tests en verde y una demo funcional.
 - Si una librería nueva parece necesaria, pregunta primero y justifica la elección.
 - Nunca desactives una validación, test o regla de seguridad "temporalmente" para avanzar. Si algo bloquea, detente y pregunta.
 - Para la interfaz, muestra capturas (Playwright) del resultado antes de dar por terminada una pantalla.
+- Cuando se tome una decisión de arquitectura, librería o diseño, regístrala en §12 con fecha y motivo.
+
+---
+
+## 12. Registro de decisiones
+
+| # | Fecha | Decisión | Motivo |
+|---|---|---|---|
+| D1 | 2026-11-08 | La identidad es local (ASP.NET Core Identity + TOTP, registro cerrado, dueño por CLI). Strava es solo conexión de datos. | La app no debe depender de Strava para existir; el import de Garmin funciona sin Strava. |
+| D2 | 2026-11-08 | Frontend en Svelte 5 como SPA con Vite, sin SvelteKit. React descartado. | El backend es .NET; no se necesita SSR. Svelte genera bundles pequeños y CSS extraíble (CSP). |
+| D3 | 2026-11-08 | Privacidad fail-closed: sin onboarding de privacidad no se sirve geometría; trim de 400 m por defecto; geometría pública materializada y versionada. | Evitar cualquier ventana en la que se filtre la ubicación real. |
+| D4 | 2026-11-08 | CSP sin `unsafe-inline`: build CSP de MapLibre, worker en el mismo origen, CSS extraído; excepciones solo con hash/nonce documentado. | Cerrar la contradicción entre "CSP estricta" y `unsafe-inline`. |
+| D5 | 2026-11-08 | Modelo de actividad canónica + `activity_sources`. Idempotencia por fuente (restricción única) separada de la unificación entre fuentes (tiempo + distancia + Hausdorff). | Son dos problemas distintos; enlazar fuentes conserva "View on Strava" y la mejor geometría. |
+| D6 | 2026-11-08 | `STRAVA_API_BASE_URL` configurable con valor por defecto actual; verificar la migración a `api-v3.strava.com` al iniciar la fase 5. | El anuncio indica disponibilidad desde enero de 2027 con ventana de migración. |
+| D7 | 2026-11-08 | Miniaturas renderizadas en el cliente desde `geom_thumb`; perfil de elevación de 64 muestras calculado al importar. Sin SVG en la base de datos. | Menos almacenamiento, y la miniatura respeta automáticamente la privacidad porque deriva de `geom_public`. |
